@@ -1,10 +1,11 @@
 import { GraphApiError } from "../lib/graphApi.js";
-import { ACCOUNT_METRICS, fetchAccountInsight } from "../instagram/insights.js";
+import { fetchTimeseriesMetrics, fetchTotalValueMetrics, type AccountMetric } from "../instagram/insights.js";
 import { fetchMediaInsights, listAllMedia } from "../instagram/media.js";
-import { upsertAccountMetricPoint } from "../repositories/accountInsightsRepo.js";
+import { upsertAccountMetrics } from "../repositories/accountInsightsRepo.js";
 import { getAccount } from "../repositories/igAccountRepo.js";
 import {
   listRecentMediaItems,
+  markInsightsAvailable,
   markInsightsUnavailable,
   upsertMediaInsightSnapshot,
   upsertMediaItem,
@@ -29,19 +30,47 @@ export async function runDailyCollect(): Promise<void> {
   }
 
   const until = new Date();
-  const since = new Date(until.getTime() - 2 * 24 * 60 * 60 * 1000);
+  const dayMs = 24 * 60 * 60 * 1000;
+  const since = new Date(until.getTime() - 2 * dayMs);
 
   console.log(`Collecting account insights for @${account.igUsername ?? account.igUserId}...`);
-  for (const metric of ACCOUNT_METRICS) {
-    try {
-      const points = await fetchAccountInsight(account.igUserId, account.accessToken, metric, since, until);
+  try {
+    const byMetric = await fetchTimeseriesMetrics(account.igUserId, account.accessToken, since, until);
+    const perDate = new Map<string, Map<AccountMetric, number>>();
+    for (const [metric, points] of byMetric) {
       for (const p of points) {
-        await upsertAccountMetricPoint(account.id, metric, p.date, p.value);
+        if (!perDate.has(p.date)) perDate.set(p.date, new Map());
+        perDate.get(p.date)!.set(metric, p.value);
       }
+    }
+    for (const [date, values] of perDate) {
+      await upsertAccountMetrics(account.id, date, values);
+    }
+  } catch (err) {
+    if (err instanceof GraphApiError && err.isTokenError) throw err;
+    console.error(
+      `ALERT: failed to collect time-series metrics: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  await sleep(CALL_DELAY_MS);
+
+  // total_value metrics report one aggregate per requested range, so each of
+  // the last two days is asked for separately.
+  for (let daysAgo = 0; daysAgo < 2; daysAgo++) {
+    const dayEnd = new Date(until.getTime() - daysAgo * dayMs);
+    const dayStart = new Date(dayEnd.getTime() - dayMs);
+    try {
+      const values = await fetchTotalValueMetrics(
+        account.igUserId,
+        account.accessToken,
+        dayStart,
+        dayEnd,
+      );
+      await upsertAccountMetrics(account.id, dayEnd.toISOString().slice(0, 10), values);
     } catch (err) {
       if (err instanceof GraphApiError && err.isTokenError) throw err;
       console.error(
-        `ALERT: failed to collect metric "${metric}": ${err instanceof Error ? err.message : String(err)}`,
+        `ALERT: failed to collect total-value metrics: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
     await sleep(CALL_DELAY_MS);
@@ -74,6 +103,7 @@ export async function runDailyCollect(): Promise<void> {
         media.mediaProductType ?? undefined,
       );
       await upsertMediaInsightSnapshot(media.id, today, values);
+      await markInsightsAvailable(media.id);
     } catch (err) {
       if (err instanceof GraphApiError && err.isTokenError) throw err;
       const message = err instanceof Error ? err.message : String(err);

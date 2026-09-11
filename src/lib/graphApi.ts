@@ -26,6 +26,14 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * True when the API rejected the range because it reaches past the two years
+ * of history it serves. That's the end of the data, not a failure.
+ */
+export function isHistoryLimitError(err: GraphApiError): boolean {
+  return err.code === 100 && /available for the last \d+ years?/i.test(err.message);
+}
+
 function buildUrl(pathOrUrl: string, params: Record<string, string | number | undefined>): string {
   const url = pathOrUrl.startsWith("http") ? new URL(pathOrUrl) : new URL(`${BASE_URL}${pathOrUrl}`);
   for (const [key, value] of Object.entries(params)) {

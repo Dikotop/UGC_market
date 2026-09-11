@@ -72,6 +72,24 @@ export async function exchangeForLongLivedToken(token: string): Promise<LongLive
 }
 
 /**
+ * Turns any Instagram user token into a long-lived one. The App Dashboard's
+ * "Generate token" button already hands out a long-lived token, and those are
+ * rejected by the exchange endpoint - so fall back to a refresh, which is the
+ * supported way to extend one.
+ */
+export async function ensureLongLivedToken(token: string): Promise<LongLivedToken> {
+  try {
+    return await exchangeForLongLivedToken(token);
+  } catch (exchangeError) {
+    try {
+      return await refreshLongLivedToken(token);
+    } catch {
+      throw exchangeError;
+    }
+  }
+}
+
+/**
  * Refreshes an existing long-lived Instagram user token, extending its
  * validity by another ~60 days. The token must be at least 24h old and not
  * yet expired - an already-expired token can't be refreshed this way and

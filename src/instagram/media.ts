@@ -13,27 +13,33 @@ export function listAllMedia(igUserId: string, accessToken: string): AsyncGenera
 }
 
 export interface MediaInsightValues {
-  impressions?: number;
   reach?: number;
+  views?: number;
   likes?: number;
   comments?: number;
   saved?: number;
   shares?: number;
-  plays?: number;
-  video_views?: number;
   total_interactions?: number;
+  profile_visits?: number;
+  follows?: number;
+  ig_reels_video_view_total_time?: number;
+  ig_reels_avg_watch_time?: number;
 }
 
-const IMAGE_METRICS = ["impressions", "reach", "likes", "comments", "saved", "shares", "total_interactions"];
-const VIDEO_METRICS = [...IMAGE_METRICS, "plays", "video_views"];
+const COMMON_METRICS = ["reach", "views", "likes", "comments", "saved", "shares", "total_interactions"];
+// Reels don't support profile_visits/follows; everything else doesn't support
+// the reels watch-time metrics. Asking for an unsupported metric fails the
+// entire call, so the sets are kept strictly separate.
+const REELS_METRICS = [...COMMON_METRICS, "ig_reels_video_view_total_time", "ig_reels_avg_watch_time"];
+const POST_METRICS = [...COMMON_METRICS, "profile_visits", "follows"];
 
 export async function fetchMediaInsights(
   mediaId: string,
   accessToken: string,
   mediaProductType: string | undefined,
 ): Promise<MediaInsightValues> {
-  const metrics = mediaProductType === "REELS" || mediaProductType === "VIDEO" ? VIDEO_METRICS : IMAGE_METRICS;
-  const res = await graphGet<{ data: { name: string; values: { value?: number }[] }[] }>(
+  const metrics = mediaProductType === "REELS" ? REELS_METRICS : POST_METRICS;
+  const res = await graphGet<{ data: { name: string; values?: { value?: number }[] }[] }>(
     `/${mediaId}/insights`,
     {
       access_token: accessToken,
@@ -43,7 +49,7 @@ export async function fetchMediaInsights(
 
   const values: MediaInsightValues = {};
   for (const item of res.data) {
-    const v = item.values[0]?.value;
+    const v = item.values?.[0]?.value;
     if (typeof v === "number") {
       (values as Record<string, number>)[item.name] = v;
     }

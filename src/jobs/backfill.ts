@@ -1,81 +1,158 @@
-import { GraphApiError } from "../lib/graphApi.js";
-import { type AccountMetric, ACCOUNT_METRICS, fetchAccountInsight } from "../instagram/insights.js";
+import { GraphApiError, isHistoryLimitError } from "../lib/graphApi.js";
+import {
+  TIMESERIES_METRICS,
+  TOTAL_VALUE_METRICS,
+  fetchTimeseriesMetrics,
+  fetchTotalValueMetrics,
+  type AccountMetric,
+} from "../instagram/insights.js";
 import { fetchMediaInsights, listAllMedia } from "../instagram/media.js";
 import {
-  upsertAccountMetricPoint,
+  upsertAccountMetrics,
   upsertBackfillStatus,
+  type BackfillStatus,
 } from "../repositories/accountInsightsRepo.js";
 import { getAccount } from "../repositories/igAccountRepo.js";
 import {
+  markInsightsAvailable,
   markInsightsUnavailable,
   upsertMediaInsightSnapshot,
   upsertMediaItem,
 } from "../repositories/mediaRepo.js";
 
 const WINDOW_DAYS = 30;
-// Safety cap so a runaway loop can't hammer the API forever - ~2.5 years
-// of 30-day windows, comfortably beyond what any metric actually supports.
-const MAX_WINDOWS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+// The API serves at most two years of history; past that it rejects the
+// range outright, so there's no point walking further back.
+const MAX_HISTORY_DAYS = 730;
 const CALL_DELAY_MS = 150;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-type StopReason = "no-more-data" | "api-limit" | "max-windows";
+function isoDate(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
 
-async function backfillAccountMetric(
+interface MetricOutcome {
+  earliest: string | null;
+  status: BackfillStatus;
+  notes: string;
+}
+
+/**
+ * Walks 30-day windows backwards, writing every daily point each call
+ * returns. All time-series metrics come from the same call, so they share
+ * one pass.
+ */
+async function backfillTimeseries(
   igUserId: string,
   accessToken: string,
   igAccountId: number,
-  metric: AccountMetric,
-): Promise<void> {
+  historyStart: Date,
+): Promise<Map<AccountMetric, MetricOutcome>> {
+  const earliestSeen = new Map<AccountMetric, string>();
   let until = new Date();
-  let earliestDate: string | null = null;
-  let windowsWalked = 0;
-  let sawAnyData = false;
-  let stopReason: StopReason = "no-more-data";
+  let windows = 0;
+  let stopReason = "reached history limit";
 
-  while (windowsWalked < MAX_WINDOWS) {
-    const since = new Date(until.getTime() - WINDOW_DAYS * 24 * 60 * 60 * 1000);
-    let points;
+  while (until.getTime() > historyStart.getTime()) {
+    const since = new Date(Math.max(until.getTime() - WINDOW_DAYS * DAY_MS, historyStart.getTime()));
+
+    let byMetric;
     try {
-      points = await fetchAccountInsight(igUserId, accessToken, metric, since, until);
+      byMetric = await fetchTimeseriesMetrics(igUserId, accessToken, since, until);
     } catch (err) {
-      if (err instanceof GraphApiError && !err.isTokenError) {
-        stopReason = "api-limit";
-        break;
-      }
+      if (err instanceof GraphApiError && isHistoryLimitError(err)) break;
       throw err;
     }
 
-    if (points.length === 0) {
-      stopReason = "no-more-data";
+    const perDate = new Map<string, Map<AccountMetric, number>>();
+    for (const [metric, points] of byMetric) {
+      for (const p of points) {
+        if (!perDate.has(p.date)) perDate.set(p.date, new Map());
+        perDate.get(p.date)!.set(metric, p.value);
+        const prev = earliestSeen.get(metric);
+        if (!prev || p.date < prev) earliestSeen.set(metric, p.date);
+      }
+    }
+    for (const [date, values] of perDate) {
+      await upsertAccountMetrics(igAccountId, date, values);
+    }
+
+    if (perDate.size === 0) {
+      stopReason = "no more data";
       break;
     }
 
-    sawAnyData = true;
-    for (const p of points) {
-      await upsertAccountMetricPoint(igAccountId, metric, p.date, p.value);
-      if (!earliestDate || p.date < earliestDate) earliestDate = p.date;
-    }
-
     until = since;
-    windowsWalked++;
-    if (windowsWalked === MAX_WINDOWS) stopReason = "max-windows";
+    windows++;
     await sleep(CALL_DELAY_MS);
   }
 
-  const status = !sawAnyData ? "failed" : stopReason === "no-more-data" ? "completed" : "partial";
-  await upsertBackfillStatus({
-    igAccountId,
-    metricName: metric,
-    earliestAvailableDate: earliestDate,
-    status,
-    notes: `stopped: ${stopReason}, windows walked: ${windowsWalked}`,
-  });
+  const outcomes = new Map<AccountMetric, MetricOutcome>();
+  for (const metric of TIMESERIES_METRICS) {
+    const earliest = earliestSeen.get(metric) ?? null;
+    outcomes.set(metric, {
+      earliest,
+      status: earliest ? "completed" : "failed",
+      notes: `time series, ${windows} windows walked, stopped: ${stopReason}`,
+    });
+  }
+  return outcomes;
+}
 
-  console.log(`  [${metric}] status=${status} earliest=${earliestDate ?? "n/a"}`);
+/**
+ * total_value metrics only report an aggregate for the range asked for, so
+ * each day needs its own call. One call covers all of them at once.
+ */
+async function backfillTotalValues(
+  igUserId: string,
+  accessToken: string,
+  igAccountId: number,
+  historyStart: Date,
+): Promise<Map<AccountMetric, MetricOutcome>> {
+  const earliestSeen = new Map<AccountMetric, string>();
+  let days = 0;
+  let stopReason = "reached history limit";
+
+  for (let until = new Date(); until.getTime() > historyStart.getTime(); until = new Date(until.getTime() - DAY_MS)) {
+    const since = new Date(until.getTime() - DAY_MS);
+
+    let values;
+    try {
+      values = await fetchTotalValueMetrics(igUserId, accessToken, since, until);
+    } catch (err) {
+      if (err instanceof GraphApiError && isHistoryLimitError(err)) break;
+      throw err;
+    }
+
+    // The window ends at `until`, so that's the day these totals describe.
+    const date = isoDate(until);
+    await upsertAccountMetrics(igAccountId, date, values);
+    // A zero is what the API reports once a day falls outside the range it
+    // still has data for, so only non-zero days count as "available".
+    for (const [metric, value] of values) {
+      if (value === 0) continue;
+      const prev = earliestSeen.get(metric);
+      if (!prev || date < prev) earliestSeen.set(metric, date);
+    }
+
+    days++;
+    await sleep(CALL_DELAY_MS);
+  }
+
+  const outcomes = new Map<AccountMetric, MetricOutcome>();
+  for (const metric of TOTAL_VALUE_METRICS) {
+    const earliest = earliestSeen.get(metric) ?? null;
+    outcomes.set(metric, {
+      earliest,
+      status: earliest ? "completed" : "failed",
+      notes: `total_value, ${days} days walked, stopped: ${stopReason}`,
+    });
+  }
+  return outcomes;
 }
 
 export async function runBackfill(): Promise<void> {
@@ -84,9 +161,28 @@ export async function runBackfill(): Promise<void> {
     throw new Error("No Instagram account configured. Run `npm run auth:setup` first.");
   }
 
-  console.log(`Backfilling account-level metrics for @${account.igUsername ?? account.igUserId}...`);
-  for (const metric of ACCOUNT_METRICS) {
-    await backfillAccountMetric(account.igUserId, account.accessToken, account.id, metric);
+  const historyStart = new Date(Date.now() - MAX_HISTORY_DAYS * DAY_MS);
+
+  console.log(`Backfilling account time-series metrics for @${account.igUsername ?? account.igUserId}...`);
+  const timeseries = await backfillTimeseries(
+    account.igUserId,
+    account.accessToken,
+    account.id,
+    historyStart,
+  );
+
+  console.log("Backfilling account total-value metrics (one call per day, this takes a few minutes)...");
+  const totals = await backfillTotalValues(account.igUserId, account.accessToken, account.id, historyStart);
+
+  for (const [metric, outcome] of [...timeseries, ...totals]) {
+    await upsertBackfillStatus({
+      igAccountId: account.id,
+      metricName: metric,
+      earliestAvailableDate: outcome.earliest,
+      status: outcome.status,
+      notes: outcome.notes,
+    });
+    console.log(`  [${metric}] status=${outcome.status} earliest=${outcome.earliest ?? "n/a"}`);
   }
 
   console.log("Backfilling media list...");
@@ -107,7 +203,7 @@ export async function runBackfill(): Promise<void> {
 
   console.log("Backfilling media insights...");
   let unavailableCount = 0;
-  const today = new Date().toISOString().slice(0, 10);
+  const today = isoDate(new Date());
   for (const media of mediaBuffer) {
     try {
       const values = await fetchMediaInsights(
@@ -116,6 +212,7 @@ export async function runBackfill(): Promise<void> {
         media.mediaProductType ?? undefined,
       );
       await upsertMediaInsightSnapshot(media.dbId, today, values);
+      await markInsightsAvailable(media.dbId);
     } catch (err) {
       if (err instanceof GraphApiError && err.isTokenError) throw err;
       const message = err instanceof Error ? err.message : String(err);

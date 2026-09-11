@@ -3,7 +3,7 @@ import { URL } from "node:url";
 import { pool } from "../db/pool.js";
 import { env } from "../config/env.js";
 import { resolveIgBusinessAccount } from "../instagram/account.js";
-import { buildAuthorizationUrl, exchangeCodeForToken, exchangeForLongLivedToken } from "../instagram/auth.js";
+import { buildAuthorizationUrl, ensureLongLivedToken, exchangeCodeForToken } from "../instagram/auth.js";
 import { upsertAccount } from "../repositories/igAccountRepo.js";
 
 function waitForAuthorizationCode(): Promise<string> {
@@ -44,22 +44,23 @@ function waitForAuthorizationCode(): Promise<string> {
 }
 
 async function main(): Promise<void> {
-  // Fallback path: paste a short-lived token obtained manually (e.g. via
-  // Graph API Explorer) if the local-listener OAuth flow isn't viable.
+  // Fallback path: paste a token obtained manually (App Dashboard > API setup
+  // with Instagram login > Generate token) if the local-listener OAuth flow
+  // isn't viable.
   const tokenArg = process.argv.find((a) => a.startsWith("--token="));
-  let shortLivedToken: string;
+  let token: string;
 
   if (tokenArg) {
-    shortLivedToken = tokenArg.slice("--token=".length);
-    console.log("Using provided short-lived token from --token=...");
+    token = tokenArg.slice("--token=".length);
+    console.log("Using provided token from --token=...");
   } else {
     const code = await waitForAuthorizationCode();
     console.log("Authorization code received, exchanging for access token...");
-    shortLivedToken = await exchangeCodeForToken(code);
+    token = await exchangeCodeForToken(code);
   }
 
-  console.log("Exchanging for a long-lived token...");
-  const longLived = await exchangeForLongLivedToken(shortLivedToken);
+  console.log("Obtaining a long-lived token...");
+  const longLived = await ensureLongLivedToken(token);
 
   console.log("Resolving linked Instagram Business account...");
   const resolved = await resolveIgBusinessAccount(longLived.accessToken);

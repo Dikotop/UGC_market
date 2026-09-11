@@ -22,7 +22,8 @@ export interface InsightValue {
 export interface InsightMetricResult {
   name: string;
   period: string;
-  values: InsightValue[];
+  values?: InsightValue[];
+  total_value?: { value?: number };
   title?: string;
   description?: string;
 }

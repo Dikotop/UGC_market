@@ -49,33 +49,47 @@ export async function upsertMediaInsightSnapshot(
 ): Promise<void> {
   await pool.query(
     `INSERT INTO media_insights_daily
-       (media_item_id, snapshot_date, impressions, reach, likes, comments, saved, shares, plays, video_views, total_interactions, raw)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       (media_item_id, snapshot_date, reach, views, likes, comments, saved, shares, total_interactions,
+        profile_visits, follows, ig_reels_video_view_total_time, ig_reels_avg_watch_time, raw)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
      ON CONFLICT (media_item_id, snapshot_date) DO UPDATE SET
-       impressions = EXCLUDED.impressions,
        reach = EXCLUDED.reach,
+       views = EXCLUDED.views,
        likes = EXCLUDED.likes,
        comments = EXCLUDED.comments,
        saved = EXCLUDED.saved,
        shares = EXCLUDED.shares,
-       plays = EXCLUDED.plays,
-       video_views = EXCLUDED.video_views,
        total_interactions = EXCLUDED.total_interactions,
+       profile_visits = EXCLUDED.profile_visits,
+       follows = EXCLUDED.follows,
+       ig_reels_video_view_total_time = EXCLUDED.ig_reels_video_view_total_time,
+       ig_reels_avg_watch_time = EXCLUDED.ig_reels_avg_watch_time,
        raw = EXCLUDED.raw`,
     [
       mediaItemId,
       date,
-      values.impressions ?? null,
       values.reach ?? null,
+      values.views ?? null,
       values.likes ?? null,
       values.comments ?? null,
       values.saved ?? null,
       values.shares ?? null,
-      values.plays ?? null,
-      values.video_views ?? null,
       values.total_interactions ?? null,
+      values.profile_visits ?? null,
+      values.follows ?? null,
+      values.ig_reels_video_view_total_time ?? null,
+      values.ig_reels_avg_watch_time ?? null,
       JSON.stringify(values),
     ],
+  );
+}
+
+/** Clears a previous failure marker once insights come back successfully. */
+export async function markInsightsAvailable(mediaItemId: number): Promise<void> {
+  await pool.query(
+    `UPDATE media_items SET insights_unavailable = false, insights_error = NULL, updated_at = now()
+     WHERE id = $1 AND insights_unavailable = true`,
+    [mediaItemId],
   );
 }
 
@@ -92,17 +106,19 @@ export interface MediaWithLatestInsight {
     likes: number | null;
     comments: number | null;
     reach: number | null;
-    impressions: number | null;
+    views: number | null;
+    totalInteractions: number | null;
   } | null;
 }
 
 export async function listMediaWithLatestInsights(igAccountId: number): Promise<MediaWithLatestInsight[]> {
   const { rows } = await pool.query(
     `SELECT m.id, m.ig_media_id, m.media_type, m.permalink, m.caption, m.posted_at, m.insights_unavailable,
-            latest.snapshot_date, latest.likes, latest.comments, latest.reach, latest.impressions
+            latest.snapshot_date, latest.likes, latest.comments, latest.reach, latest.views,
+            latest.total_interactions
      FROM media_items m
      LEFT JOIN LATERAL (
-       SELECT snapshot_date, likes, comments, reach, impressions
+       SELECT snapshot_date, likes, comments, reach, views, total_interactions
        FROM media_insights_daily d
        WHERE d.media_item_id = m.id
        ORDER BY snapshot_date DESC
@@ -126,7 +142,8 @@ export async function listMediaWithLatestInsights(igAccountId: number): Promise<
           likes: r.likes,
           comments: r.comments,
           reach: r.reach,
-          impressions: r.impressions,
+          views: r.views,
+          totalInteractions: r.total_interactions,
         }
       : null,
   }));
@@ -146,7 +163,8 @@ export async function getMediaHistory(igMediaId: string): Promise<MediaHistoryRe
   if (!media) return { media: null, history: [] };
 
   const { rows: history } = await pool.query(
-    `SELECT snapshot_date, impressions, reach, likes, comments, saved, shares, plays, video_views, total_interactions
+    `SELECT snapshot_date, reach, views, likes, comments, saved, shares, total_interactions,
+            profile_visits, follows, ig_reels_video_view_total_time, ig_reels_avg_watch_time
      FROM media_insights_daily WHERE media_item_id = $1 ORDER BY snapshot_date ASC`,
     [media.id],
   );
