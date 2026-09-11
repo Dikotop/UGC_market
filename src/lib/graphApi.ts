@@ -5,8 +5,8 @@ const BASE_URL = `https://graph.instagram.com/${env.GRAPH_API_VERSION}`;
 
 const RATE_LIMIT_CODES = new Set([4, 17, 32]);
 const TOKEN_ERROR_CODE = 190;
-const MAX_RETRIES = 3;
-const BASE_DELAY_MS = 1000;
+const MAX_RETRIES = 5;
+const BASE_DELAY_MS = 2000;
 
 export class GraphApiError extends Error {
   code: number;
@@ -32,6 +32,15 @@ function sleep(ms: number): Promise<void> {
  */
 export function isHistoryLimitError(err: GraphApiError): boolean {
   return err.code === 100 && /available for the last \d+ years?/i.test(err.message);
+}
+
+/**
+ * Sustained request bursts get "Please reduce the amount of data you're
+ * asking for" under a generic error code. It's throttling, not a bad
+ * request - the identical call succeeds once the burst subsides.
+ */
+function isThrottleMessage(message: string): boolean {
+  return /reduce the amount of data/i.test(message);
 }
 
 function buildUrl(pathOrUrl: string, params: Record<string, string | number | undefined>): string {
@@ -70,7 +79,8 @@ export async function graphGet<T>(
       throw error;
     }
 
-    const isRateLimited = res.status === 429 || RATE_LIMIT_CODES.has(code);
+    const isRateLimited =
+      res.status === 429 || RATE_LIMIT_CODES.has(code) || isThrottleMessage(message);
     if (!isRateLimited || attempt === MAX_RETRIES) {
       throw error;
     }

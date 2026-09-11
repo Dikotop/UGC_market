@@ -43,6 +43,50 @@ export async function upsertAccountMetrics(
   );
 }
 
+/**
+ * Dates that already have total_value metrics written, so a re-run can skip
+ * them instead of walking the whole two years again. `views` stands in for
+ * the set: every total_value write includes it, even as a zero.
+ */
+export async function listDatesWithTotalValues(igAccountId: number): Promise<Set<string>> {
+  const { rows } = await pool.query<{ metric_date: string }>(
+    `SELECT metric_date FROM account_insights_daily
+     WHERE ig_account_id = $1 AND views IS NOT NULL`,
+    [igAccountId],
+  );
+  return new Set(rows.map((r) => r.metric_date));
+}
+
+/**
+ * Earliest date each metric has a non-zero value on. Zeros are what the API
+ * reports for days outside the range it still holds data for, so they don't
+ * count as coverage.
+ */
+export async function getEarliestNonZeroDates(
+  igAccountId: number,
+  metrics: readonly AccountMetric[],
+): Promise<Map<AccountMetric, string>> {
+  const known = metrics.filter((m) => m in METRIC_COLUMNS);
+  if (known.length === 0) return new Map();
+
+  const selects = known.map((m) => {
+    const column = METRIC_COLUMNS[m];
+    return `min(metric_date) FILTER (WHERE ${column} > 0) AS ${column}`;
+  });
+
+  const { rows } = await pool.query(
+    `SELECT ${selects.join(", ")} FROM account_insights_daily WHERE ig_account_id = $1`,
+    [igAccountId],
+  );
+
+  const out = new Map<AccountMetric, string>();
+  for (const metric of known) {
+    const value = rows[0]?.[METRIC_COLUMNS[metric]];
+    if (value) out.set(metric, typeof value === "string" ? value : String(value));
+  }
+  return out;
+}
+
 export type BackfillStatus = "completed" | "partial" | "failed";
 
 export async function upsertBackfillStatus(params: {

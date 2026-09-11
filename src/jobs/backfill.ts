@@ -8,9 +8,10 @@ import {
 } from "../instagram/insights.js";
 import { fetchMediaInsights, listAllMedia } from "../instagram/media.js";
 import {
+  getEarliestNonZeroDates,
+  listDatesWithTotalValues,
   upsertAccountMetrics,
   upsertBackfillStatus,
-  type BackfillStatus,
 } from "../repositories/accountInsightsRepo.js";
 import { getAccount } from "../repositories/igAccountRepo.js";
 import {
@@ -25,7 +26,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // The API serves at most two years of history; past that it rejects the
 // range outright, so there's no point walking further back.
 const MAX_HISTORY_DAYS = 730;
-const CALL_DELAY_MS = 150;
+const CALL_DELAY_MS = 250;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -35,9 +36,9 @@ function isoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
-interface MetricOutcome {
-  earliest: string | null;
-  status: BackfillStatus;
+/** Whether a pass covered all available history, and why it stopped if not. */
+interface PassResult {
+  complete: boolean;
   notes: string;
 }
 
@@ -51,11 +52,9 @@ async function backfillTimeseries(
   accessToken: string,
   igAccountId: number,
   historyStart: Date,
-): Promise<Map<AccountMetric, MetricOutcome>> {
-  const earliestSeen = new Map<AccountMetric, string>();
+): Promise<PassResult> {
   let until = new Date();
   let windows = 0;
-  let stopReason = "reached history limit";
 
   while (until.getTime() > historyStart.getTime()) {
     const since = new Date(Math.max(until.getTime() - WINDOW_DAYS * DAY_MS, historyStart.getTime()));
@@ -65,6 +64,9 @@ async function backfillTimeseries(
       byMetric = await fetchTimeseriesMetrics(igUserId, accessToken, since, until);
     } catch (err) {
       if (err instanceof GraphApiError && isHistoryLimitError(err)) break;
+      if (err instanceof GraphApiError && !err.isTokenError) {
+        return { complete: false, notes: `time series, ${windows} windows, stopped: ${err.message}` };
+      }
       throw err;
     }
 
@@ -73,51 +75,38 @@ async function backfillTimeseries(
       for (const p of points) {
         if (!perDate.has(p.date)) perDate.set(p.date, new Map());
         perDate.get(p.date)!.set(metric, p.value);
-        const prev = earliestSeen.get(metric);
-        if (!prev || p.date < prev) earliestSeen.set(metric, p.date);
       }
     }
     for (const [date, values] of perDate) {
       await upsertAccountMetrics(igAccountId, date, values);
     }
 
-    if (perDate.size === 0) {
-      stopReason = "no more data";
-      break;
-    }
+    if (perDate.size === 0) break;
 
     until = since;
     windows++;
     await sleep(CALL_DELAY_MS);
   }
 
-  const outcomes = new Map<AccountMetric, MetricOutcome>();
-  for (const metric of TIMESERIES_METRICS) {
-    const earliest = earliestSeen.get(metric) ?? null;
-    outcomes.set(metric, {
-      earliest,
-      status: earliest ? "completed" : "failed",
-      notes: `time series, ${windows} windows walked, stopped: ${stopReason}`,
-    });
-  }
-  return outcomes;
+  return { complete: true, notes: `time series, ${windows} windows walked` };
 }
 
 /**
  * total_value metrics only report an aggregate for the range asked for, so
- * each day needs its own call. One call covers all of them at once.
+ * each day needs its own call. One call covers all of them at once, and days
+ * already stored are skipped so an interrupted run can resume.
  */
 async function backfillTotalValues(
   igUserId: string,
   accessToken: string,
   igAccountId: number,
   historyStart: Date,
-): Promise<Map<AccountMetric, MetricOutcome>> {
-  const earliestSeen = new Map<AccountMetric, string>();
+): Promise<PassResult> {
+  const alreadyDone = await listDatesWithTotalValues(igAccountId);
   let days = 0;
-  let stopReason = "reached history limit";
 
   for (let until = new Date(); until.getTime() > historyStart.getTime(); until = new Date(until.getTime() - DAY_MS)) {
+    if (alreadyDone.has(isoDate(until))) continue;
     const since = new Date(until.getTime() - DAY_MS);
 
     let values;
@@ -125,34 +114,42 @@ async function backfillTotalValues(
       values = await fetchTotalValueMetrics(igUserId, accessToken, since, until);
     } catch (err) {
       if (err instanceof GraphApiError && isHistoryLimitError(err)) break;
+      // Throttling that outlived the retries. Keep what's written and let
+      // the next run resume from here rather than losing the whole pass.
+      if (err instanceof GraphApiError && !err.isTokenError) {
+        console.warn(`  total_value pass stopped at ${isoDate(until)}: ${err.message}`);
+        return { complete: false, notes: `total_value, ${days} days, stopped: ${err.message}` };
+      }
       throw err;
     }
 
     // The window ends at `until`, so that's the day these totals describe.
-    const date = isoDate(until);
-    await upsertAccountMetrics(igAccountId, date, values);
-    // A zero is what the API reports once a day falls outside the range it
-    // still has data for, so only non-zero days count as "available".
-    for (const [metric, value] of values) {
-      if (value === 0) continue;
-      const prev = earliestSeen.get(metric);
-      if (!prev || date < prev) earliestSeen.set(metric, date);
-    }
-
+    await upsertAccountMetrics(igAccountId, isoDate(until), values);
     days++;
     await sleep(CALL_DELAY_MS);
   }
 
-  const outcomes = new Map<AccountMetric, MetricOutcome>();
-  for (const metric of TOTAL_VALUE_METRICS) {
-    const earliest = earliestSeen.get(metric) ?? null;
-    outcomes.set(metric, {
-      earliest,
-      status: earliest ? "completed" : "failed",
-      notes: `total_value, ${days} days walked, stopped: ${stopReason}`,
+  return { complete: true, notes: `total_value, ${days} days walked` };
+}
+
+async function recordStatuses(
+  igAccountId: number,
+  metrics: readonly AccountMetric[],
+  pass: PassResult,
+): Promise<void> {
+  const earliest = await getEarliestNonZeroDates(igAccountId, metrics);
+  for (const metric of metrics) {
+    const earliestDate = earliest.get(metric) ?? null;
+    const status = !earliestDate ? "failed" : pass.complete ? "completed" : "partial";
+    await upsertBackfillStatus({
+      igAccountId,
+      metricName: metric,
+      earliestAvailableDate: earliestDate,
+      status,
+      notes: pass.notes,
     });
+    console.log(`  [${metric}] status=${status} earliest=${earliestDate ?? "n/a"}`);
   }
-  return outcomes;
 }
 
 export async function runBackfill(): Promise<void> {
@@ -164,26 +161,22 @@ export async function runBackfill(): Promise<void> {
   const historyStart = new Date(Date.now() - MAX_HISTORY_DAYS * DAY_MS);
 
   console.log(`Backfilling account time-series metrics for @${account.igUsername ?? account.igUserId}...`);
-  const timeseries = await backfillTimeseries(
+  const timeseriesPass = await backfillTimeseries(
     account.igUserId,
     account.accessToken,
     account.id,
     historyStart,
   );
+  await recordStatuses(account.id, TIMESERIES_METRICS, timeseriesPass);
 
   console.log("Backfilling account total-value metrics (one call per day, this takes a few minutes)...");
-  const totals = await backfillTotalValues(account.igUserId, account.accessToken, account.id, historyStart);
-
-  for (const [metric, outcome] of [...timeseries, ...totals]) {
-    await upsertBackfillStatus({
-      igAccountId: account.id,
-      metricName: metric,
-      earliestAvailableDate: outcome.earliest,
-      status: outcome.status,
-      notes: outcome.notes,
-    });
-    console.log(`  [${metric}] status=${outcome.status} earliest=${outcome.earliest ?? "n/a"}`);
-  }
+  const totalsPass = await backfillTotalValues(
+    account.igUserId,
+    account.accessToken,
+    account.id,
+    historyStart,
+  );
+  await recordStatuses(account.id, TOTAL_VALUE_METRICS, totalsPass);
 
   console.log("Backfilling media list...");
   let mediaCount = 0;
