@@ -36,8 +36,8 @@ function toDomain(row: IgAccountRow): IgAccount {
 export async function upsertAccount(params: {
   igUserId: string;
   igUsername?: string;
-  pageId: string;
-  pageName: string;
+  pageId?: string;
+  pageName?: string;
   accessToken: string;
   tokenExpiresAt: Date;
 }): Promise<IgAccount> {
@@ -56,8 +56,8 @@ export async function upsertAccount(params: {
     [
       params.igUserId,
       params.igUsername ?? null,
-      params.pageId,
-      params.pageName,
+      params.pageId ?? null,
+      params.pageName ?? null,
       encrypt(params.accessToken),
       params.tokenExpiresAt,
     ],

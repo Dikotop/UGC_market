@@ -32,17 +32,6 @@ export interface InsightsResponse {
   paging?: GraphPaging;
 }
 
-export interface FacebookPage {
-  id: string;
-  name: string;
-  instagram_business_account?: { id: string };
-}
-
-export interface AccountsResponse {
-  data: FacebookPage[];
-  paging?: GraphPaging;
-}
-
 export interface IgMediaItem {
   id: string;
   caption?: string;

@@ -1,7 +1,7 @@
 import { env } from "../config/env.js";
 import type { GraphErrorBody, GraphPaging } from "../types/instagram.js";
 
-const BASE_URL = `https://graph.facebook.com/${env.GRAPH_API_VERSION}`;
+const BASE_URL = `https://graph.instagram.com/${env.GRAPH_API_VERSION}`;
 
 const RATE_LIMIT_CODES = new Set([4, 17, 32]);
 const TOKEN_ERROR_CODE = 190;

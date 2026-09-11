@@ -67,13 +67,11 @@ async function main(): Promise<void> {
   await upsertAccount({
     igUserId: resolved.igUserId,
     igUsername: resolved.igUsername,
-    pageId: resolved.pageId,
-    pageName: resolved.pageName,
     accessToken: longLived.accessToken,
     tokenExpiresAt: longLived.expiresAt,
   });
 
-  console.log(`\nDone. Connected @${resolved.igUsername ?? resolved.igUserId} (via Page "${resolved.pageName}").`);
+  console.log(`\nDone. Connected @${resolved.igUsername ?? resolved.igUserId}.`);
   console.log(`Token valid until ${longLived.expiresAt.toISOString()}.`);
 }
 

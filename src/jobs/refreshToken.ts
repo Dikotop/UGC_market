@@ -1,4 +1,4 @@
-import { exchangeForLongLivedToken } from "../instagram/auth.js";
+import { refreshLongLivedToken } from "../instagram/auth.js";
 import { getAccount, updateToken } from "../repositories/igAccountRepo.js";
 
 const REFRESH_THRESHOLD_DAYS = 10;
@@ -32,7 +32,7 @@ export async function refreshTokenIfNeeded(): Promise<void> {
   }
 
   try {
-    const refreshed = await exchangeForLongLivedToken(account.accessToken);
+    const refreshed = await refreshLongLivedToken(account.accessToken);
     await updateToken(account.id, refreshed.accessToken, refreshed.expiresAt);
     console.log(`Token refreshed, now valid until ${refreshed.expiresAt.toISOString()}.`);
   } catch (err) {
